@@ -1,12 +1,15 @@
 # frozen_string_literal: true
 
 require_relative 'page'
+require_relative 'cookie'
 
 require 'set'
 
 module Spidr
   #
-  # Stores HTTP Cookies organized by host-name.
+  # Stores HTTP Cookies organized by host-name. Each cookie is stored
+  # along with the scheme, host, port, path, secure flag and expiry of
+  # the response that set it.
   #
   class CookieJar
 
@@ -41,7 +44,17 @@ module Spidr
     # @since 0.2.2
     #
     def each(&block)
-      @params.each(&block)
+      return enum_for(__method__) unless block_given?
+
+      @params.each do |host,cookies|
+        values = {}
+
+        cookies.each do |name,cookie|
+          values[name] = cookie.value
+        end
+
+        block.call(host,values)
+      end
     end
 
     #
@@ -51,14 +64,19 @@ module Spidr
     # @param [String] host
     #   Host or domain name for cookies.
     #
-    # @return [String, nil]
-    #   The cookie values or `nil` if the host does not have a cookie in the
-    #   jar.
+    # @return [Hash{String => String}]
+    #   The cookie values for the host.
     #
     # @since 0.2.2
     #
     def [](host)
-      @params[host] ||= {}
+      values = {}
+
+      (@params[host] || {}).each do |name,cookie|
+        values[name] = cookie.value
+      end
+
+      return values
     end
 
     #
@@ -73,14 +91,17 @@ module Spidr
     # @since 0.2.2
     #
     def []=(host,cookies)
-      collected = self[host]
+      collected = (@params[host] ||= {})
 
-      cookies.each do |key,value|
-        if collected[key] != value
-          collected.merge!(cookies)
+      cookies.each do |name,value|
+        if (cookie = collected[name])
+          if cookie.value != value
+            cookie.value = value
+            @dirty << host
+          end
+        else
+          collected[name] = Cookie.new(name: name, value: value, host: host)
           @dirty << host
-
-          break
         end
       end
 
@@ -99,14 +120,66 @@ module Spidr
     # @since 0.2.2
     #
     def from_page(page)
-      cookies = page.cookie_params
+      from_response(page.url,page.response)
+    end
 
-      unless cookies.empty?
-        self[page.url.host] = cookies
-        return true
+    #
+    # Stores the cookies from a response, binding each cookie to the
+    # scheme, host, port and path of the URL that the response came from.
+    #
+    # @param [URI::HTTP, String] url
+    #   The URL of the response.
+    #
+    # @param [Net::HTTPResponse] response
+    #   The response containing `Set-Cookie` headers.
+    #
+    # @return [Boolean]
+    #   Specifies whether cookies were added from the response.
+    #
+    # @since 0.7.3
+    #
+    def from_response(url,response)
+      url = URI(url)
+
+      set_cookies = (response.get_fields('Set-Cookie') || [])
+
+      return false if set_cookies.empty?
+
+      set_cookies.each do |value|
+        if (cookie = Cookie.parse(value,url))
+          store(cookie)
+        end
       end
 
-      return false
+      return true
+    end
+
+    #
+    # Stores a cookie in the jar. Storing an already expired cookie
+    # removes any existing cookie with the same name.
+    #
+    # @param [Cookie] cookie
+    #   The cookie to store.
+    #
+    # @return [Cookie]
+    #   The stored cookie.
+    #
+    # @since 0.7.3
+    #
+    def store(cookie)
+      collected = (@params[cookie.host] ||= {})
+
+      if cookie.expired?
+        # an already expired cookie deletes the existing cookie
+        if collected.delete(cookie.name)
+          @dirty << cookie.host
+        end
+      else
+        collected[cookie.name] = cookie
+        @dirty << cookie.host
+      end
+
+      return cookie
     end
 
     #
@@ -136,6 +209,44 @@ module Spidr
     end
 
     #
+    # Returns the pre-encoded Cookie header value for a given URL,
+    # containing only the cookies whose host, port, path, secure flag
+    # and expiry allow them to be sent to the URL.
+    #
+    # @param [URI::HTTP, String] url
+    #   The URL about to be requested.
+    #
+    # @return [String, nil]
+    #   The encoded Cookie, or `nil` if no cookies match the URL.
+    #
+    # @since 0.7.3
+    #
+    def for_url(url)
+      url = URI(url)
+
+      values = []
+      names  = Set[]
+
+      each_host_and_parent(url.host) do |host|
+        if (cookies = @params[host])
+          cookies.each_value do |cookie|
+            # cookies from a more specific host take precedence
+            next if names.include?(cookie.name)
+
+            if cookie.matches?(url)
+              values << cookie.to_s
+              names  << cookie.name
+            end
+          end
+        end
+      end
+
+      return nil if values.empty?
+
+      return values.join('; ')
+    end
+
+    #
     # Returns raw cookie value pairs for a given host. Includes cookies set on
     # parent domain(s).
     #
@@ -148,18 +259,17 @@ module Spidr
     # @since 0.2.7
     #
     def cookies_for_host(host)
-      host_cookies = (@params[host] || {})
-      sub_domains  = host.split('.')
+      host_cookies = {}
 
-      while sub_domains.length > 2
-        sub_domains.shift
+      each_host_and_parent(host) do |current_host|
+        if (parent_cookies = @params[current_host])
+          parent_cookies.each do |name,cookie|
+            next if cookie.expired?
 
-        if (parent_cookies = @params[sub_domains.join('.')])
-          parent_cookies.each do |name,value|
             # copy in the parent cookies, only if they haven't been
             # overridden yet.
             unless host_cookies.has_key?(name)
-              host_cookies[name] = value
+              host_cookies[name] = cookie.value
             end
           end
         end
@@ -198,6 +308,32 @@ module Spidr
     #
     def inspect
       "#<#{self.class}: #{@params.inspect}>"
+    end
+
+    protected
+
+    #
+    # Yields the given host-name, then each of its parent domains.
+    #
+    # @param [String] host
+    #   The host-name.
+    #
+    # @yield [domain]
+    #   Each host-name or parent domain.
+    #
+    # @yieldparam [String] domain
+    #   A host-name or parent domain.
+    #
+    def each_host_and_parent(host)
+      yield host
+
+      sub_domains = host.split('.')
+
+      while sub_domains.length > 2
+        sub_domains.shift
+
+        yield sub_domains.join('.')
+      end
     end
 
   end

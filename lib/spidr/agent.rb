@@ -21,6 +21,9 @@ module Spidr
 
     include Settings::UserAgent
 
+    # Maximum number of redirects to follow for a single request.
+    REDIRECT_LIMIT = 10
+
     # HTTP Host `Header` to use
     #
     # @return [String]
@@ -494,7 +497,11 @@ module Spidr
 
       until (@queue.empty? || paused? || limit_reached?)
         begin
-          visit_page(dequeue,&block)
+          url = dequeue
+
+          # skip URLs that were already visited, such as the landing
+          # URL of a previously followed redirect
+          visit_page(url,&block) unless visited?(url)
         rescue Actions::Paused
           return self
         rescue Actions::Action
@@ -692,7 +699,9 @@ module Spidr
     end
 
     #
-    # Requests and creates a new Page object from a given URL.
+    # Requests and creates a new Page object from a given URL. Any HTTP
+    # redirects are followed, and the resulting page is identified by the
+    # URL of the final response.
     #
     # @param [URI::HTTP] url
     #   The URL to request.
@@ -710,15 +719,48 @@ module Spidr
     def get_page(url)
       url = URI(url)
 
-      prepare_request(url) do |session,path,headers|
-        new_page = Page.new(url,session.get(path,headers))
+      current_url = url
+      redirects   = Set[current_url]
+      response    = nil
 
-        # save any new cookies
-        @cookies.from_page(new_page)
+      REDIRECT_LIMIT.times do
+        response = nil
 
-        yield new_page if block_given?
-        return new_page
+        prepare_request(current_url) do |session,path,headers|
+          response = session.get(path,headers)
+        end
+
+        # the request failed, and the URL was added to the failures
+        return nil unless response
+
+        # save any new cookies, bound to the URL of this response
+        @cookies.from_response(current_url,response)
+
+        location = redirect_location(response)
+        break unless location
+
+        next_url = begin
+                     sanitize_url(current_url.merge(location))
+                   rescue URI::Error
+                     break
+                   end
+
+        # only follow HTTP/HTTPS redirects
+        break unless next_url.is_a?(URI::HTTP)
+
+        # stop on redirect loops, or when redirecting to an already
+        # visited URL
+        break if (redirects.include?(next_url) || visited?(next_url))
+
+        redirects  << next_url
+        current_url = next_url
       end
+
+      # the page is identified by the URL of the final response
+      new_page = Page.new(current_url,response)
+
+      yield new_page if block_given?
+      return new_page
     end
 
     #
@@ -777,6 +819,9 @@ module Spidr
       url = sanitize_url(url)
 
       get_page(url) do |page|
+        # record both the requested URL and the final landing URL, so
+        # that neither is visited twice
+        @history << url
         @history << page.url
 
         begin
@@ -854,11 +899,32 @@ module Spidr
         headers['Authorization'] = "Basic #{authorization}"
       end
 
-      if (header_cookies = @cookies.for_host(url.host))
+      if (header_cookies = @cookies.for_url(url))
         headers['Cookie'] = header_cookies
       end
 
       return headers
+    end
+
+    #
+    # Extracts the redirect location from a response.
+    #
+    # @param [Net::HTTPResponse] response
+    #   The response to inspect.
+    #
+    # @return [String, nil]
+    #   The value of the `Location` header, if the response is an HTTP
+    #   redirect.
+    #
+    # @since 0.7.3
+    #
+    def redirect_location(response)
+      case response.code.to_i
+      when 300..399
+        location = response['Location']
+
+        location.strip unless (location.nil? || location.empty?)
+      end
     end
 
     #

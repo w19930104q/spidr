@@ -1,3 +1,19 @@
+### 0.7.3 / 2026-11-12
+
+* {Spidr::Agent#get_page} now follows HTTP redirects (up to
+  {Spidr::Agent::REDIRECT_LIMIT}) and identifies the returned {Spidr::Page}
+  by the URL of the final response, so relative links are expanded against
+  the final URL.
+* Redirect loops and redirects to already visited URLs are no longer
+  followed, and URLs in the queue that were already visited (such as the
+  landing URL of a redirect) are no longer visited twice.
+* Added {Spidr::Cookie}, which stores each cookie along with the scheme,
+  host, port, path, secure flag and expiry of the response that set it.
+* Added {Spidr::CookieJar#from_response}, {Spidr::CookieJar#store} and
+  {Spidr::CookieJar#for_url}. Cookies are now only sent to URLs whose
+  scheme, host, port and path they match, so cross-origin redirects no
+  longer leak the origin's cookies or `Authorization` credentials.
+
 ### 0.7.2 / 2025-02-02
 
 * Added the `base64` gem as a dependency to satisfy Bundler.
